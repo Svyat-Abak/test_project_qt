@@ -1,19 +1,26 @@
 #include "MainWindow.h"
 
 #include "../core/AudioController.h"
+#include "../core/LibraryStore.h"
+#include "../core/ListeningStats.h"
 #include "../core/PlaybackQueue.h"
 #include "../core/Playlist.h"
 #include "../core/PlaylistManager.h"
 #include "../core/Track.h"
-#include "../core/TrackStore.h"
+#include "dialogs/ProfileDialog.h"
+#include "dialogs/TrackMetadataDialog.h"
 #include "widgets/CoverLabel.h"
 #include "widgets/NeonButton.h"
+#include "widgets/NowPlayingPanel.h"
+#include "widgets/ParticleBackground.h"
 #include "widgets/SpectrumVisualizer.h"
 
 #include <QApplication>
-#include <QFile>
-#include <QPushButton>
+#include <QCloseEvent>
 #include <QDir>
+#include <QDragEnterEvent>
+#include <QDropEvent>
+#include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QHBoxLayout>
@@ -22,58 +29,119 @@
 #include <QLineEdit>
 #include <QListWidget>
 #include <QMessageBox>
-#include <QPixmap>
-#include <QSizePolicy>
+#include <QMimeData>
+#include <QPushButton>
+#include <QResizeEvent>
 #include <QSlider>
 #include <QSplitter>
-#include <QStyle>
 #include <QTextEdit>
+#include <QTimer>
+#include <QUrl>
 #include <QVBoxLayout>
+#include <algorithm>
 
 namespace {
-QString trackListLabel(Track *track) {
-    return QStringLiteral("%1 — %2  [%3]")
-        .arg(track->artist(), track->title(), track->formattedDuration());
+
+bool isAudioFile(const QString &path) {
+    const QString suffix = QFileInfo(path).suffix().toLower();
+    return suffix == QStringLiteral("mp3") || suffix == QStringLiteral("wav")
+           || suffix == QStringLiteral("flac");
 }
+
+QString trackListLabel(Track *track, bool favorite) {
+    const QString heart = favorite ? QStringLiteral("♥ ") : QString();
+    const QString missing = track->fileExists() ? QString() : QStringLiteral(" [нет файла]");
+    return QStringLiteral("%1%2 — %3  [%4]%5")
+        .arg(heart, track->artist(), track->title(), track->formattedDuration(), missing);
+}
+
+QVector<QPair<QString, qint64>> topEntries(const QHash<QString, qint64> &data,
+                                           const std::function<QString(const QString &)> &resolver,
+                                           int limit = 8) {
+    QVector<QPair<QString, qint64>> entries;
+    for (auto it = data.constBegin(); it != data.constEnd(); ++it) {
+        entries.append({resolver(it.key()), it.value()});
+    }
+    std::sort(entries.begin(), entries.end(), [](const auto &a, const auto &b) {
+        return a.second > b.second;
+    });
+    if (entries.size() > limit) {
+        entries.resize(limit);
+    }
+    for (auto &entry : entries) {
+        entry.second /= 60000; // minutes for chart
+    }
+    return entries;
+}
+
 } // namespace
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
     , m_playlistManager(new PlaylistManager(this))
     , m_queue(new PlaybackQueue(this))
-    , m_audio(new AudioController(this)) {
+    , m_audio(new AudioController(this))
+    , m_stats(new ListeningStats(this))
+    , m_statsTimer(new QTimer(this)) {
     setWindowTitle(QStringLiteral("Neon Audio Player"));
-    resize(1100, 640);
-    setMinimumSize(900, 520);
+    resize(1200, 680);
+    setMinimumSize(960, 540);
+    setAcceptDrops(true);
+
+    LibraryStore::load(m_playlistManager, m_stats);
+
     setupUi();
     loadStyleSheet();
     connectSignals();
+
     refreshPlaylistList();
     refreshTrackList();
     refreshQueueList();
-    setUiEnabled(false);
+    bool hasTracks = false;
+    for (Playlist *playlist : m_playlistManager->playlists()) {
+        if (!playlist->getTracks().isEmpty()) {
+            hasTracks = true;
+            break;
+        }
+    }
+    setUiEnabled(hasTracks);
+    if (hasTracks) {
+        m_placeholderLabel->hide();
+    }
+    syncOverlayGeometry();
 }
 
-MainWindow::~MainWindow() = default;
+MainWindow::~MainWindow() {
+    saveLibrary();
+}
 
 void MainWindow::setupUi() {
-    auto *central = new QWidget(this);
-    setCentralWidget(central);
+    m_centralContainer = new QWidget(this);
+    m_centralContainer->setObjectName(QStringLiteral("centralContainer"));
+    setCentralWidget(m_centralContainer);
 
-    auto *rootLayout = new QVBoxLayout(central);
+    m_particles = new ParticleBackground(m_centralContainer);
+    m_contentWidget = new QWidget(m_centralContainer);
+    m_contentWidget->setObjectName(QStringLiteral("contentLayer"));
+    m_contentWidget->setAttribute(Qt::WA_StyledBackground, true);
+
+    auto *rootLayout = new QVBoxLayout(m_contentWidget);
     rootLayout->setContentsMargins(8, 8, 8, 8);
     rootLayout->setSpacing(6);
 
-    auto *bodySplitter = new QSplitter(Qt::Horizontal, central);
+    m_mainSplitter = new QSplitter(Qt::Horizontal, m_contentWidget);
 
-    // Left sidebar
-    auto *sidebar = new QWidget(bodySplitter);
+    auto *sidebar = new QWidget(m_mainSplitter);
     sidebar->setObjectName(QStringLiteral("sidebar"));
     sidebar->setMinimumWidth(220);
     sidebar->setMaximumWidth(280);
     auto *sidebarLayout = new QVBoxLayout(sidebar);
     sidebarLayout->setContentsMargins(6, 6, 6, 6);
     sidebarLayout->setSpacing(4);
+
+    auto *profileBtn = new QPushButton(QStringLiteral("Профиль"), sidebar);
+    profileBtn->setObjectName(QStringLiteral("textButton"));
+    profileBtn->setCursor(Qt::PointingHandCursor);
 
     auto *playlistHeader = new QLabel(QStringLiteral("Playlists"), sidebar);
     playlistHeader->setObjectName(QStringLiteral("sectionHeader"));
@@ -83,13 +151,10 @@ void MainWindow::setupUi() {
     auto *playlistButtons = new QHBoxLayout();
     auto *addPlaylistBtn = new NeonButton(QStringLiteral("+"), sidebar);
     addPlaylistBtn->setFixedSize(32, 32);
-    addPlaylistBtn->setToolTip(QStringLiteral("Add playlist"));
     auto *renamePlaylistBtn = new NeonButton(QStringLiteral("✎"), sidebar);
     renamePlaylistBtn->setFixedSize(32, 32);
-    renamePlaylistBtn->setToolTip(QStringLiteral("Rename playlist"));
     auto *removePlaylistBtn = new NeonButton(QStringLiteral("−"), sidebar);
     removePlaylistBtn->setFixedSize(32, 32);
-    removePlaylistBtn->setToolTip(QStringLiteral("Remove playlist"));
     playlistButtons->addWidget(addPlaylistBtn);
     playlistButtons->addWidget(renamePlaylistBtn);
     playlistButtons->addWidget(removePlaylistBtn);
@@ -102,17 +167,15 @@ void MainWindow::setupUi() {
     auto *queueButtons = new QHBoxLayout();
     auto *addQueueBtn = new NeonButton(QStringLiteral("Q+"), sidebar);
     addQueueBtn->setFixedSize(32, 32);
-    addQueueBtn->setToolTip(QStringLiteral("Add to queue"));
     auto *removeQueueBtn = new NeonButton(QStringLiteral("Q−"), sidebar);
     removeQueueBtn->setFixedSize(32, 32);
-    removeQueueBtn->setToolTip(QStringLiteral("Remove from queue"));
     auto *clearQueueBtn = new NeonButton(QStringLiteral("Clr"), sidebar);
     clearQueueBtn->setFixedSize(32, 32);
-    clearQueueBtn->setToolTip(QStringLiteral("Clear queue"));
     queueButtons->addWidget(addQueueBtn);
     queueButtons->addWidget(removeQueueBtn);
     queueButtons->addWidget(clearQueueBtn);
 
+    sidebarLayout->addWidget(profileBtn);
     sidebarLayout->addWidget(playlistHeader);
     sidebarLayout->addWidget(m_playlistList, 2);
     sidebarLayout->addLayout(playlistButtons);
@@ -120,17 +183,15 @@ void MainWindow::setupUi() {
     sidebarLayout->addWidget(m_queueList, 1);
     sidebarLayout->addLayout(queueButtons);
 
-    // Center panel
-    auto *centerPanel = new QWidget(bodySplitter);
+    auto *centerPanel = new QWidget(m_mainSplitter);
     centerPanel->setObjectName(QStringLiteral("centerPanel"));
     auto *centerLayout = new QVBoxLayout(centerPanel);
     centerLayout->setContentsMargins(6, 6, 6, 6);
     centerLayout->setSpacing(6);
 
-    m_placeholderLabel = new QLabel(QStringLiteral("Load tracks to start the neon experience"), centerPanel);
+    m_placeholderLabel = new QLabel(QStringLiteral("Перетащите треки сюда или нажмите Add Tracks"), centerPanel);
     m_placeholderLabel->setObjectName(QStringLiteral("placeholderLabel"));
     m_placeholderLabel->setAlignment(Qt::AlignCenter);
-    m_placeholderLabel->setMaximumHeight(28);
 
     m_cover = new CoverLabel(centerPanel);
     m_cover->setFixedSize(140, 140);
@@ -143,45 +204,42 @@ void MainWindow::setupUi() {
     m_artistEdit->setPlaceholderText(QStringLiteral("Artist"));
 
     auto *metaButtons = new QHBoxLayout();
-    metaButtons->setSpacing(6);
     auto *setCoverBtn = new QPushButton(QStringLiteral("Обложка"), centerPanel);
     setCoverBtn->setObjectName(QStringLiteral("textButton"));
-    setCoverBtn->setCursor(Qt::PointingHandCursor);
-    setCoverBtn->setMaximumHeight(28);
+    auto *editMetaBtn = new QPushButton(QStringLiteral("Метаданные…"), centerPanel);
+    editMetaBtn->setObjectName(QStringLiteral("textButton"));
     m_saveMetadataBtn = new QPushButton(QStringLiteral("Зафиксировать"), centerPanel);
     m_saveMetadataBtn->setObjectName(QStringLiteral("textButton"));
-    m_saveMetadataBtn->setCursor(Qt::PointingHandCursor);
-    m_saveMetadataBtn->setMaximumHeight(28);
+    for (QPushButton *btn : {setCoverBtn, editMetaBtn, m_saveMetadataBtn}) {
+        btn->setCursor(Qt::PointingHandCursor);
+        btn->setMaximumHeight(28);
+    }
     metaButtons->addWidget(setCoverBtn);
+    metaButtons->addWidget(editMetaBtn);
     metaButtons->addWidget(m_saveMetadataBtn);
     metaButtons->addStretch();
 
     auto *trackInfoLayout = new QVBoxLayout();
-    trackInfoLayout->setSpacing(4);
     trackInfoLayout->addWidget(m_titleEdit);
     trackInfoLayout->addWidget(m_artistEdit);
     trackInfoLayout->addLayout(metaButtons);
-    trackInfoLayout->addStretch();
 
     auto *topRow = new QHBoxLayout();
-    topRow->setSpacing(10);
     topRow->addWidget(m_cover, 0, Qt::AlignTop);
     topRow->addLayout(trackInfoLayout, 1);
 
     m_visualizer = new SpectrumVisualizer(24, centerPanel);
     m_visualizer->setFixedHeight(52);
-    m_visualizer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
 
     m_descriptionEdit = new QTextEdit(centerPanel);
-    m_descriptionEdit->setPlaceholderText(QStringLiteral("Notes and description for this track…"));
     m_descriptionEdit->setObjectName(QStringLiteral("descriptionEdit"));
-    m_descriptionEdit->setMinimumHeight(56);
+    m_descriptionEdit->setPlaceholderText(QStringLiteral("Заметки к треку…"));
     m_descriptionEdit->setMaximumHeight(80);
 
     auto *searchRow = new QHBoxLayout();
     m_searchEdit = new QLineEdit(centerPanel);
-    m_searchEdit->setPlaceholderText(QStringLiteral("Search by title or artist…"));
     m_searchEdit->setObjectName(QStringLiteral("searchEdit"));
+    m_searchEdit->setPlaceholderText(QStringLiteral("Поиск…"));
     auto *addTracksBtn = new QPushButton(QStringLiteral("Add Tracks"), centerPanel);
     addTracksBtn->setObjectName(QStringLiteral("textButton"));
     addTracksBtn->setCursor(Qt::PointingHandCursor);
@@ -190,6 +248,7 @@ void MainWindow::setupUi() {
 
     m_trackList = new QListWidget(centerPanel);
     m_trackList->setObjectName(QStringLiteral("trackList"));
+    m_trackList->setAcceptDrops(false);
 
     centerLayout->addWidget(m_placeholderLabel);
     centerLayout->addLayout(topRow);
@@ -198,38 +257,51 @@ void MainWindow::setupUi() {
     centerLayout->addLayout(searchRow);
     centerLayout->addWidget(m_trackList, 1);
 
-    bodySplitter->addWidget(sidebar);
-    bodySplitter->addWidget(centerPanel);
-    bodySplitter->setStretchFactor(0, 0);
-    bodySplitter->setStretchFactor(1, 1);
+    m_nowPlayingPanel = new NowPlayingPanel(m_mainSplitter);
+    m_nowPlayingPanel->hide();
 
-    // Bottom player bar (compact)
-    auto *playerBar = new QWidget(central);
+    m_mainSplitter->addWidget(sidebar);
+    m_mainSplitter->addWidget(centerPanel);
+    m_mainSplitter->addWidget(m_nowPlayingPanel);
+    m_mainSplitter->setStretchFactor(0, 0);
+    m_mainSplitter->setStretchFactor(1, 1);
+    m_mainSplitter->setStretchFactor(2, 0);
+
+    auto *playerBar = new QWidget(m_contentWidget);
     playerBar->setObjectName(QStringLiteral("playerBar"));
-    playerBar->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
     playerBar->setMaximumHeight(96);
     auto *playerLayout = new QVBoxLayout(playerBar);
     playerLayout->setContentsMargins(8, 6, 8, 6);
     playerLayout->setSpacing(4);
 
     auto *progressRow = new QHBoxLayout();
-    progressRow->setSpacing(6);
+    m_nowPlayingCover = new CoverLabel(playerBar);
+    m_nowPlayingCover->setFixedSize(44, 44);
+    m_nowPlayingCover->setCursor(Qt::PointingHandCursor);
+    m_nowPlayingCover->setToolTip(QStringLiteral("Сейчас играет — открыть панель"));
+
     m_currentTimeLabel = new QLabel(QStringLiteral("00:00"), playerBar);
     m_currentTimeLabel->setObjectName(QStringLiteral("timeLabel"));
     m_currentTimeLabel->setFixedWidth(40);
     m_progressSlider = new QSlider(Qt::Horizontal, playerBar);
     m_progressSlider->setObjectName(QStringLiteral("progressSlider"));
-    m_progressSlider->setRange(0, 0);
     m_progressSlider->setFixedHeight(18);
+    m_heartBtn = new QPushButton(QStringLiteral("♡"), playerBar);
+    m_heartBtn->setObjectName(QStringLiteral("heartButton"));
+    m_heartBtn->setFixedSize(32, 32);
+    m_heartBtn->setCursor(Qt::PointingHandCursor);
+    m_heartBtn->setToolTip(QStringLiteral("Любимое"));
     m_totalTimeLabel = new QLabel(QStringLiteral("00:00"), playerBar);
     m_totalTimeLabel->setObjectName(QStringLiteral("timeLabel"));
     m_totalTimeLabel->setFixedWidth(40);
+
+    progressRow->addWidget(m_nowPlayingCover);
     progressRow->addWidget(m_currentTimeLabel);
     progressRow->addWidget(m_progressSlider, 1);
+    progressRow->addWidget(m_heartBtn);
     progressRow->addWidget(m_totalTimeLabel);
 
     auto *controlsRow = new QHBoxLayout();
-    controlsRow->setSpacing(8);
     controlsRow->addStretch();
     auto *prevBtn = new NeonButton(QStringLiteral("⏮"), playerBar);
     prevBtn->setFixedSize(36, 36);
@@ -245,23 +317,25 @@ void MainWindow::setupUi() {
     controlsRow->addWidget(nextBtn);
     controlsRow->addStretch();
 
-    auto *volumeIcon = new QLabel(QStringLiteral("🔊"), playerBar);
-    volumeIcon->setObjectName(QStringLiteral("volumeIcon"));
     m_volumeSlider = new QSlider(Qt::Horizontal, playerBar);
     m_volumeSlider->setObjectName(QStringLiteral("volumeSlider"));
     m_volumeSlider->setRange(0, 100);
     m_volumeSlider->setValue(75);
-    m_volumeSlider->setFixedHeight(18);
     m_volumeSlider->setMaximumWidth(120);
-    controlsRow->addWidget(volumeIcon);
-    controlsRow->addWidget(m_volumeSlider);
+    auto *volumeIcon = new QLabel(QStringLiteral("🔊"), playerBar);
+    auto *volumeRow = new QHBoxLayout();
+    volumeRow->addStretch();
+    volumeRow->addWidget(volumeIcon);
+    volumeRow->addWidget(m_volumeSlider);
 
     playerLayout->addLayout(progressRow);
     playerLayout->addLayout(controlsRow);
+    playerLayout->addLayout(volumeRow);
 
-    rootLayout->addWidget(bodySplitter, 1);
+    rootLayout->addWidget(m_mainSplitter, 1);
     rootLayout->addWidget(playerBar, 0);
 
+    connect(profileBtn, &QPushButton::clicked, this, &MainWindow::onProfile);
     connect(addPlaylistBtn, &QPushButton::clicked, this, &MainWindow::onAddPlaylist);
     connect(renamePlaylistBtn, &QPushButton::clicked, this, &MainWindow::onRenamePlaylist);
     connect(removePlaylistBtn, &QPushButton::clicked, this, &MainWindow::onRemovePlaylist);
@@ -269,32 +343,55 @@ void MainWindow::setupUi() {
     connect(removeQueueBtn, &QPushButton::clicked, this, &MainWindow::onRemoveFromQueue);
     connect(clearQueueBtn, &QPushButton::clicked, this, &MainWindow::onClearQueue);
     connect(setCoverBtn, &QPushButton::clicked, this, &MainWindow::onSetCover);
+    connect(editMetaBtn, &QPushButton::clicked, this, &MainWindow::onOpenMetadataEditor);
     connect(m_saveMetadataBtn, &QPushButton::clicked, this, &MainWindow::onFixMetadata);
-    connect(m_titleEdit, &QLineEdit::textChanged, this, [this] {
-        if (m_updatingMetadata) {
-            return;
-        }
-        Track *track = activeTrack();
-        if (track && !track->isMetadataLocked()) {
-            track->setTitle(m_titleEdit->text());
-            refreshTrackList(m_searchEdit->text());
-        }
-    });
-    connect(m_artistEdit, &QLineEdit::textChanged, this, [this] {
-        if (m_updatingMetadata) {
-            return;
-        }
-        Track *track = activeTrack();
-        if (track && !track->isMetadataLocked()) {
-            track->setArtist(m_artistEdit->text());
-            refreshTrackList(m_searchEdit->text());
-        }
-    });
     connect(addTracksBtn, &QPushButton::clicked, this, &MainWindow::onAddTracks);
     connect(prevBtn, &QPushButton::clicked, this, &MainWindow::onPrevious);
     connect(m_playPauseButton, &QPushButton::clicked, this, &MainWindow::onPlayPause);
     connect(stopBtn, &QPushButton::clicked, this, &MainWindow::onStop);
     connect(nextBtn, &QPushButton::clicked, this, &MainWindow::onNext);
+    connect(m_heartBtn, &QPushButton::clicked, this, &MainWindow::onToggleFavorite);
+    connect(m_nowPlayingCover, &CoverLabel::clicked, this, &MainWindow::onToggleNowPlaying);
+
+    syncOverlayGeometry();
+}
+
+void MainWindow::syncOverlayGeometry() {
+    if (!m_centralContainer || !m_particles || !m_contentWidget) {
+        return;
+    }
+    const QRect r = m_centralContainer->rect();
+    m_particles->setGeometry(r);
+    m_contentWidget->setGeometry(r);
+    m_particles->lower();
+    m_contentWidget->raise();
+}
+
+void MainWindow::resizeEvent(QResizeEvent *event) {
+    QMainWindow::resizeEvent(event);
+    syncOverlayGeometry();
+}
+
+void MainWindow::dragEnterEvent(QDragEnterEvent *event) {
+    if (event->mimeData()->hasUrls()) {
+        event->acceptProposedAction();
+    }
+}
+
+void MainWindow::dropEvent(QDropEvent *event) {
+    QStringList paths;
+    for (const QUrl &url : event->mimeData()->urls()) {
+        if (url.isLocalFile()) {
+            paths.append(url.toLocalFile());
+        }
+    }
+    importAudioFiles(paths);
+    event->acceptProposedAction();
+}
+
+void MainWindow::closeEvent(QCloseEvent *event) {
+    saveLibrary();
+    QMainWindow::closeEvent(event);
 }
 
 void MainWindow::loadStyleSheet() {
@@ -305,9 +402,7 @@ void MainWindow::loadStyleSheet() {
             return;
         }
     }
-    if (styleFile.isOpen()) {
-        qApp->setStyleSheet(QString::fromUtf8(styleFile.readAll()));
-    }
+    qApp->setStyleSheet(QString::fromUtf8(styleFile.readAll()));
 }
 
 void MainWindow::connectSignals() {
@@ -341,10 +436,18 @@ void MainWindow::connectSignals() {
         refreshTrackList(m_searchEdit->text());
         setUiEnabled(true);
         m_placeholderLabel->hide();
+        saveLibrary();
     });
     connect(m_playlistManager, &PlaylistManager::trackRemoved, this, [this](Track *) {
         refreshTrackList(m_searchEdit->text());
+        saveLibrary();
     });
+    connect(m_playlistManager, &PlaylistManager::favoritesChanged, this, [this](Track *, bool) {
+        refreshTrackList(m_searchEdit->text());
+        updateHeartButton();
+        saveLibrary();
+    });
+    connect(m_playlistManager, &PlaylistManager::libraryChanged, this, &MainWindow::saveLibrary);
 
     connect(m_queue, &PlaybackQueue::queueChanged, this, &MainWindow::refreshQueueList);
 
@@ -352,19 +455,55 @@ void MainWindow::connectSignals() {
     connect(m_audio, &AudioController::durationChanged, this, &MainWindow::onDurationChanged);
     connect(m_audio, &AudioController::playbackStateChanged, this, &MainWindow::onPlaybackStateChanged);
     connect(m_audio, &AudioController::trackMetadataUpdated, this, &MainWindow::onTrackMetadataUpdated);
-    connect(m_audio, &AudioController::trackChanged, this, &MainWindow::displayTrack);
+    connect(m_audio, &AudioController::trackChanged, this, [this](Track *track) {
+        displayTrack(track);
+        syncNowPlayingUi(track);
+    });
     connect(m_audio, &AudioController::finished, this, &MainWindow::onAudioFinished);
-    connect(m_titleEdit, &QLineEdit::returnPressed, this, &MainWindow::onFixMetadata);
-    connect(m_artistEdit, &QLineEdit::returnPressed, this, &MainWindow::onFixMetadata);
+
+    connect(m_nowPlayingPanel, &NowPlayingPanel::editMetadataRequested, this, &MainWindow::openMetadataDialog);
+    connect(m_nowPlayingPanel, &NowPlayingPanel::closeRequested, this, [this] {
+        m_nowPlayingVisible = false;
+        m_nowPlayingPanel->hide();
+    });
+
+    connect(m_statsTimer, &QTimer::timeout, this, &MainWindow::onStatsTick);
+    m_statsTimer->setInterval(1000);
 
     m_audio->setTrackResolver([this](bool forward) { return resolveTrack(forward); });
+}
+
+void MainWindow::saveLibrary() {
+    LibraryStore::save(m_playlistManager, m_stats);
+}
+
+void MainWindow::importAudioFiles(const QStringList &paths) {
+    Track *last = nullptr;
+    for (const QString &path : paths) {
+        if (!isAudioFile(path)) {
+            continue;
+        }
+        last = m_playlistManager->addTrackToCurrent(path);
+        if (last) {
+            m_queue->addTrack(last);
+        }
+    }
+    if (last) {
+        displayTrack(last);
+        selectTrackInList(last);
+        saveLibrary();
+    }
 }
 
 void MainWindow::refreshPlaylistList() {
     const int previousRow = m_playlistList->currentRow();
     m_playlistList->clear();
     for (Playlist *playlist : m_playlistManager->playlists()) {
-        auto *item = new QListWidgetItem(playlist->name());
+        QString label = playlist->name();
+        if (playlist->isFavorites()) {
+            label = QStringLiteral("❤ %1").arg(playlist->name());
+        }
+        auto *item = new QListWidgetItem(label);
         item->setData(Qt::UserRole, QVariant::fromValue(reinterpret_cast<quintptr>(playlist)));
         m_playlistList->addItem(item);
     }
@@ -380,15 +519,17 @@ void MainWindow::refreshTrackList(const QString &filter) {
     if (!playlist) {
         return;
     }
-    const QVector<Track *> tracks = playlist->search(filter);
-    for (Track *track : tracks) {
-        auto *item = new QListWidgetItem(trackListLabel(track));
+    const bool favPlaylist = playlist->isFavorites();
+    for (Track *track : playlist->search(filter)) {
+        const bool fav = m_playlistManager->isFavorite(track);
+        auto *item = new QListWidgetItem(trackListLabel(track, fav && !favPlaylist));
         item->setData(Qt::UserRole, QVariant::fromValue(reinterpret_cast<quintptr>(track)));
+        if (!track->fileExists()) {
+            item->setForeground(QColor(255, 120, 120));
+        }
         m_trackList->addItem(item);
     }
-    if (m_trackList->count() == 0) {
-        m_placeholderLabel->setVisible(playlist->getTracks().isEmpty());
-    }
+    m_placeholderLabel->setVisible(playlist->getTracks().isEmpty());
 }
 
 void MainWindow::refreshQueueList() {
@@ -407,7 +548,6 @@ void MainWindow::refreshQueueList() {
 void MainWindow::displayTrack(Track *track) {
     m_editingTrack = track;
     m_updatingMetadata = true;
-
     if (!track) {
         m_titleEdit->clear();
         m_artistEdit->clear();
@@ -415,6 +555,7 @@ void MainWindow::displayTrack(Track *track) {
         m_descriptionEdit->clear();
         m_totalTimeLabel->setText(QStringLiteral("00:00"));
         updateMetadataEditState(nullptr);
+        updateHeartButton();
         m_updatingMetadata = false;
         return;
     }
@@ -424,20 +565,39 @@ void MainWindow::displayTrack(Track *track) {
     m_totalTimeLabel->setText(track->formattedDuration());
     m_descriptionEdit->setPlainText(track->descriptionText());
     m_cover->loadCoverFromPath(track->coverPath());
+    m_cover->setFavoriteBadge(m_playlistManager->isFavorite(track));
     if (track->coverPath().isEmpty() || !QFile::exists(track->coverPath())) {
-        m_cover->setPlaceholderText(QStringLiteral("No Cover"));
+        m_cover->setPlaceholderText(m_playlistManager->isFavorite(track) ? QStringLiteral("❤") : QStringLiteral("No Cover"));
     }
     updateMetadataEditState(track);
-
+    updateHeartButton();
     m_updatingMetadata = false;
+}
+
+void MainWindow::syncNowPlayingUi(Track *track) {
+    if (!track) {
+        m_nowPlayingCover->clearCover();
+        m_nowPlayingCover->setFavoriteBadge(false);
+        return;
+    }
+    m_nowPlayingCover->loadCoverFromPath(track->coverPath());
+    m_nowPlayingCover->setFavoriteBadge(m_playlistManager->isFavorite(track));
+    if (m_nowPlayingVisible) {
+        m_nowPlayingPanel->setTrack(track);
+    }
+    updateHeartButton();
 }
 
 void MainWindow::applyEditsFromUi(Track *track) {
     if (!track) {
         return;
     }
-    track->setTitle(m_titleEdit->text().trimmed().isEmpty() ? track->title() : m_titleEdit->text().trimmed());
-    track->setArtist(m_artistEdit->text().trimmed().isEmpty() ? track->artist() : m_artistEdit->text().trimmed());
+    if (!m_titleEdit->text().trimmed().isEmpty()) {
+        track->setTitle(m_titleEdit->text().trimmed());
+    }
+    if (!m_artistEdit->text().trimmed().isEmpty()) {
+        track->setArtist(m_artistEdit->text().trimmed());
+    }
     track->setDescriptionText(m_descriptionEdit->toPlainText());
 }
 
@@ -448,6 +608,13 @@ void MainWindow::updateMetadataEditState(Track *track) {
     m_descriptionEdit->setReadOnly(locked);
     m_saveMetadataBtn->setEnabled(track != nullptr);
     m_saveMetadataBtn->setText(locked ? QStringLiteral("Изменить") : QStringLiteral("Зафиксировать"));
+}
+
+void MainWindow::updateHeartButton() {
+    Track *track = m_audio->currentTrack() ? m_audio->currentTrack() : activeTrack();
+    const bool fav = track && m_playlistManager->isFavorite(track);
+    m_heartBtn->setText(fav ? QStringLiteral("♥") : QStringLiteral("♡"));
+    m_heartBtn->setStyleSheet(fav ? QStringLiteral("color: #ff00cc; font-size: 16px;") : QString());
 }
 
 void MainWindow::selectTrackInList(Track *track) {
@@ -483,10 +650,7 @@ Track *MainWindow::selectedTrack() const {
 
 Track *MainWindow::resolveTrack(bool forward) {
     if (!m_queue->isEmpty()) {
-        if (forward) {
-            return m_queue->advanceNext();
-        }
-        return m_queue->advancePrevious();
+        return forward ? m_queue->advanceNext() : m_queue->advancePrevious();
     }
     Playlist *playlist = m_playlistManager->currentPlaylist();
     if (!playlist || playlist->getTracks().isEmpty()) {
@@ -497,22 +661,26 @@ Track *MainWindow::resolveTrack(bool forward) {
     if (index < 0) {
         return playlist->getTracks().first();
     }
-    const int count = playlist->getTracks().size();
     const int nextIndex = forward ? index + 1 : index - 1;
-    if (nextIndex < 0 || nextIndex >= count) {
+    if (nextIndex < 0 || nextIndex >= playlist->getTracks().size()) {
         return nullptr;
     }
     return playlist->getTracks().at(nextIndex);
 }
 
 QString MainWindow::formatTime(qint64 ms) const {
-    if (ms <= 0) {
-        return QStringLiteral("00:00");
+    return Track::formatMs(ms);
+}
+
+qint64 MainWindow::trackDurationForSlider(Track *track) const {
+    if (!track) {
+        return m_audio->duration();
     }
-    const qint64 totalSeconds = ms / 1000;
-    return QStringLiteral("%1:%2")
-        .arg(totalSeconds / 60, 2, 10, QChar('0'))
-        .arg(totalSeconds % 60, 2, 10, QChar('0'));
+    const qint64 effective = track->effectiveDuration();
+    if (effective > 0) {
+        return effective;
+    }
+    return m_audio->duration();
 }
 
 void MainWindow::updatePlayPauseButton(bool playing) {
@@ -523,43 +691,49 @@ void MainWindow::updatePlayPauseButton(bool playing) {
 void MainWindow::setUiEnabled(bool hasTracks) {
     m_playPauseButton->setEnabled(hasTracks);
     m_progressSlider->setEnabled(hasTracks);
-    if (!hasTracks) {
-        m_placeholderLabel->show();
+    m_heartBtn->setEnabled(hasTracks);
+}
+
+void MainWindow::openMetadataDialog(Track *track) {
+    if (!track) {
+        track = activeTrack();
+    }
+    if (!track) {
+        return;
+    }
+
+    TrackMetadataDialog dialog(this);
+    dialog.setTrack(track);
+    if (dialog.exec() == QDialog::Accepted) {
+        displayTrack(track);
+        refreshTrackList(m_searchEdit->text());
+        syncNowPlayingUi(track);
+        if (m_nowPlayingVisible) {
+            m_nowPlayingPanel->setTrack(track);
+        }
+        saveLibrary();
     }
 }
 
 void MainWindow::onAddTracks() {
     const QStringList paths = QFileDialog::getOpenFileNames(
         this,
-        QStringLiteral("Add Audio Tracks"),
+        QStringLiteral("Добавить треки"),
         QString(),
-        QStringLiteral("Audio Files (*.mp3 *.wav *.flac);;All Files (*)"));
-    if (paths.isEmpty()) {
-        return;
-    }
-    Track *last = nullptr;
-    for (const QString &path : paths) {
-        last = m_playlistManager->addTrackToCurrent(path);
-        m_queue->addTrack(last);
-    }
-    if (last) {
-        displayTrack(last);
-        m_trackList->setCurrentRow(m_trackList->count() - 1);
-    }
+        QStringLiteral("Audio (*.mp3 *.wav *.flac);;All Files (*)"));
+    importAudioFiles(paths);
 }
 
 void MainWindow::onAddPlaylist() {
     bool ok = false;
-    const QString name = QInputDialog::getText(
-        this, QStringLiteral("New Playlist"), QStringLiteral("Playlist name:"),
-        QLineEdit::Normal, QStringLiteral("My Playlist"), &ok);
+    const QString name = QInputDialog::getText(this, QStringLiteral("Плейлист"), QStringLiteral("Название:"),
+                                               QLineEdit::Normal, QStringLiteral("My Playlist"), &ok);
     if (!ok || name.trimmed().isEmpty()) {
         return;
     }
     Playlist *playlist = m_playlistManager->createPlaylist(name.trimmed());
     m_playlistManager->setCurrentPlaylist(playlist);
     refreshPlaylistList();
-    m_playlistList->setCurrentRow(m_playlistList->count() - 1);
 }
 
 void MainWindow::onRemovePlaylist() {
@@ -568,8 +742,8 @@ void MainWindow::onRemovePlaylist() {
         return;
     }
     auto *playlist = reinterpret_cast<Playlist *>(item->data(Qt::UserRole).value<quintptr>());
-    if (m_playlistManager->playlists().size() <= 1) {
-        QMessageBox::information(this, QStringLiteral("Playlist"), QStringLiteral("Cannot remove the last playlist."));
+    if (playlist->isFavorites()) {
+        QMessageBox::information(this, QStringLiteral("Плейлист"), QStringLiteral("Плейлист «Любимое» нельзя удалить."));
         return;
     }
     m_playlistManager->removePlaylist(playlist);
@@ -582,15 +756,16 @@ void MainWindow::onRenamePlaylist() {
         return;
     }
     auto *playlist = reinterpret_cast<Playlist *>(item->data(Qt::UserRole).value<quintptr>());
-    bool ok = false;
-    const QString name = QInputDialog::getText(
-        this, QStringLiteral("Rename Playlist"), QStringLiteral("New name:"),
-        QLineEdit::Normal, playlist->name(), &ok);
-    if (!ok || name.trimmed().isEmpty()) {
+    if (playlist->isFavorites()) {
         return;
     }
-    m_playlistManager->renamePlaylist(playlist, name.trimmed());
-    refreshPlaylistList();
+    bool ok = false;
+    const QString name = QInputDialog::getText(this, QStringLiteral("Переименовать"), QStringLiteral("Название:"),
+                                               QLineEdit::Normal, playlist->name(), &ok);
+    if (ok && !name.trimmed().isEmpty()) {
+        m_playlistManager->renamePlaylist(playlist, name.trimmed());
+        refreshPlaylistList();
+    }
 }
 
 void MainWindow::onPlaylistSelectionChanged() {
@@ -612,6 +787,11 @@ void MainWindow::onTrackDoubleClicked() {
     if (!track) {
         return;
     }
+    if (!track->fileExists()) {
+        QMessageBox::warning(this, QStringLiteral("Файл не найден"),
+                             QStringLiteral("Файл отсутствует по пути:\n%1").arg(track->filePath()));
+        return;
+    }
     m_audio->loadTrack(track);
     m_audio->play();
     const int queueIndex = m_queue->tracks().indexOf(track);
@@ -627,10 +807,9 @@ void MainWindow::onSearchTextChanged(const QString &text) {
 
 void MainWindow::onAddToQueue() {
     Track *track = selectedTrack();
-    if (!track) {
-        return;
+    if (track) {
+        m_queue->addTrack(track);
     }
-    m_queue->addTrack(track);
 }
 
 void MainWindow::onRemoveFromQueue() {
@@ -638,8 +817,7 @@ void MainWindow::onRemoveFromQueue() {
     if (!item) {
         return;
     }
-    auto *track = reinterpret_cast<Track *>(item->data(Qt::UserRole).value<quintptr>());
-    m_queue->removeTrack(track);
+    m_queue->removeTrack(reinterpret_cast<Track *>(item->data(Qt::UserRole).value<quintptr>()));
 }
 
 void MainWindow::onClearQueue() {
@@ -664,11 +842,12 @@ void MainWindow::onPlayPause() {
         m_audio->pause();
         return;
     }
-    Track *track = m_audio->currentTrack();
+    Track *track = m_audio->currentTrack() ? m_audio->currentTrack() : selectedTrack();
     if (!track) {
-        track = selectedTrack();
+        return;
     }
-    if (!track) {
+    if (!track->fileExists()) {
+        QMessageBox::warning(this, QStringLiteral("Файл не найден"), track->filePath());
         return;
     }
     if (m_audio->currentTrack() != track) {
@@ -690,6 +869,10 @@ void MainWindow::onNext() {
         updatePlayPauseButton(false);
         return;
     }
+    if (!track->fileExists()) {
+        QMessageBox::warning(this, QStringLiteral("Файл не найден"), track->filePath());
+        return;
+    }
     if (m_queue->contains(track)) {
         m_queue->setCurrentIndex(m_queue->tracks().indexOf(track));
         refreshQueueList();
@@ -702,7 +885,7 @@ void MainWindow::onNext() {
 
 void MainWindow::onPrevious() {
     Track *track = resolveTrack(false);
-    if (!track) {
+    if (!track || !track->fileExists()) {
         return;
     }
     if (m_queue->contains(track)) {
@@ -716,7 +899,8 @@ void MainWindow::onPrevious() {
 }
 
 void MainWindow::onSeek(int position) {
-    if (m_audio->duration() > 0) {
+    const qint64 maxDur = trackDurationForSlider(m_audio->currentTrack());
+    if (maxDur > 0) {
         m_audio->setPosition(position);
         m_currentTimeLabel->setText(formatTime(position));
     }
@@ -727,36 +911,7 @@ void MainWindow::onVolumeChanged(int value) {
 }
 
 void MainWindow::onSetCover() {
-    Track *track = activeTrack();
-    if (!track) {
-        QMessageBox::information(this, QStringLiteral("Обложка"),
-                                 QStringLiteral("Сначала выберите трек в списке."));
-        return;
-    }
-
-    QString startDir = QDir::homePath();
-    if (!track->coverPath().isEmpty()) {
-        startDir = QFileInfo(track->coverPath()).absolutePath();
-    } else if (!track->filePath().isEmpty()) {
-        startDir = QFileInfo(track->filePath()).absolutePath();
-    }
-
-    const QString path = QFileDialog::getOpenFileName(
-        this,
-        QStringLiteral("Выберите обложку"),
-        startDir,
-        QStringLiteral("Images (*.png *.jpg *.jpeg);;All Files (*)"),
-        nullptr,
-        QFileDialog::DontUseNativeDialog);
-    if (path.isEmpty()) {
-        return;
-    }
-
-    track->setCoverPath(path);
-    m_editingTrack = track;
-    m_cover->loadCoverFromPath(path);
-    TrackStore::save(track);
-    selectTrackInList(track);
+    openMetadataDialog(activeTrack());
 }
 
 void MainWindow::onFixMetadata() {
@@ -764,19 +919,56 @@ void MainWindow::onFixMetadata() {
     if (!track) {
         return;
     }
-
     if (track->isMetadataLocked()) {
         track->setMetadataLocked(false);
         updateMetadataEditState(track);
         return;
     }
-
     applyEditsFromUi(track);
     track->setMetadataLocked(true);
-    TrackStore::save(track);
     displayTrack(track);
     refreshTrackList(m_searchEdit->text());
-    selectTrackInList(track);
+    saveLibrary();
+}
+
+void MainWindow::onOpenMetadataEditor() {
+    openMetadataDialog(activeTrack());
+}
+
+void MainWindow::onToggleFavorite() {
+    Track *track = m_audio->currentTrack() ? m_audio->currentTrack() : activeTrack();
+    if (!track) {
+        return;
+    }
+    m_playlistManager->toggleFavorite(track);
+    displayTrack(track);
+    syncNowPlayingUi(track);
+}
+
+void MainWindow::onToggleNowPlaying() {
+    Track *track = m_audio->currentTrack();
+    if (!track) {
+        return;
+    }
+    m_nowPlayingVisible = !m_nowPlayingVisible;
+    m_nowPlayingPanel->setVisible(m_nowPlayingVisible);
+    if (m_nowPlayingVisible) {
+        m_nowPlayingPanel->setTrack(track);
+    }
+}
+
+void MainWindow::onProfile() {
+    const auto trackResolver = [this](const QString &id) -> QString {
+        Track *track = m_playlistManager->findTrackById(id);
+        return track ? track->title() : id.left(8);
+    };
+
+    ProfileDialog dialog(this);
+    dialog.setStats(
+        m_stats->totalListenMs(),
+        topEntries(m_stats->trackListenMs(), trackResolver),
+        topEntries(m_stats->playlistListenMs(), [](const QString &key) { return key; }));
+    dialog.exec();
 }
 
 void MainWindow::onDescriptionChanged() {
@@ -800,12 +992,27 @@ void MainWindow::onPositionChanged(qint64 position) {
 }
 
 void MainWindow::onDurationChanged(qint64 duration) {
-    m_progressSlider->setRange(0, static_cast<int>(duration));
-    m_totalTimeLabel->setText(formatTime(duration));
+    Q_UNUSED(duration)
+    Track *track = m_audio->currentTrack();
+    const qint64 dur = trackDurationForSlider(track);
+    m_progressSlider->setRange(0, static_cast<int>(qMax<qint64>(0, dur)));
+    m_totalTimeLabel->setText(formatTime(dur));
 }
 
 void MainWindow::onPlaybackStateChanged(bool playing) {
     updatePlayPauseButton(playing);
+    if (playing) {
+        m_stats->startSession(m_audio->currentTrack(), m_playlistManager->currentPlaylist());
+        m_statsTimer->start();
+    } else {
+        m_stats->stopSession();
+        m_statsTimer->stop();
+        saveLibrary();
+    }
+}
+
+void MainWindow::onStatsTick() {
+    m_stats->tick();
 }
 
 void MainWindow::onTrackMetadataUpdated(Track *track) {
@@ -815,8 +1022,10 @@ void MainWindow::onTrackMetadataUpdated(Track *track) {
     }
     if (track == m_editingTrack || track == m_audio->currentTrack()) {
         displayTrack(track);
+        syncNowPlayingUi(track);
     }
     refreshTrackList(m_searchEdit->text());
+    saveLibrary();
 }
 
 void MainWindow::onAudioFinished() {
@@ -824,9 +1033,8 @@ void MainWindow::onAudioFinished() {
     if (played && m_queue->contains(played)) {
         m_queue->consumeTrack(played);
         refreshQueueList();
-
         Track *next = m_queue->currentTrack();
-        if (next) {
+        if (next && next->fileExists()) {
             m_audio->loadTrack(next);
             m_audio->play();
             displayTrack(next);
@@ -834,7 +1042,8 @@ void MainWindow::onAudioFinished() {
             return;
         }
     }
-
     m_audio->stop();
     updatePlayPauseButton(false);
+    m_stats->stopSession();
+    m_statsTimer->stop();
 }

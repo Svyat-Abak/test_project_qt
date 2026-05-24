@@ -1,18 +1,26 @@
 /* Neon Audio Player — cyberpunk theme */
 
 QWidget {
-    background-color: #0f0f0f;
+    background-color: transparent;
     color: #ffffff;
     font-family: "Segoe UI", "SF Pro Display", "Helvetica Neue", sans-serif;
     font-size: 13px;
 }
 
 QMainWindow {
-    background-color: #0f0f0f;
+    background-color: #0a0a12;
 }
 
-#sidebar, #centerPanel, #playerBar {
-    background-color: #151515;
+#centralContainer {
+    background-color: transparent;
+}
+
+#contentLayer {
+    background-color: rgba(10, 10, 18, 0.55);
+}
+
+#sidebar, #centerPanel, #playerBar, #nowPlayingPanel {
+    background-color: rgba(21, 21, 21, 0.92);
     border-radius: 12px;
     border: 1px solid rgba(0, 229, 255, 0.15);
 }
@@ -211,4 +219,43 @@ QScrollBar::handle:vertical {
 
 QScrollBar::handle:vertical:hover {
     background: rgba(255, 0, 204, 0.45);
+}
+
+QPushButton#heartButton {
+    background-color: rgba(21, 21, 21, 0.9);
+    border: 1px solid rgba(255, 0, 204, 0.5);
+    border-radius: 16px;
+    color: #ffffff;
+    font-size: 14px;
+}
+
+QPushButton#heartButton:hover {
+    border-color: #ff00cc;
+    background-color: rgba(40, 20, 40, 0.95);
+}
+
+#npTitle {
+    font-size: 20px;
+    font-weight: bold;
+    color: #ffffff;
+}
+
+#npArtist {
+    color: #ff00cc;
+    font-size: 13px;
+}
+
+#npPath {
+    color: rgba(255, 255, 255, 0.45);
+    font-size: 10px;
+}
+
+#profileDialog, #metadataDialog {
+    background-color: #151515;
+}
+
+#profileTotal {
+    font-size: 16px;
+    color: #00e5ff;
+    padding: 8px 0;
 }

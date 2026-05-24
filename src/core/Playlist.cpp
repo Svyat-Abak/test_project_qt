@@ -1,13 +1,14 @@
 #include "Playlist.h"
 #include "Track.h"
 
-#include <QStringList>
-
 Playlist::Playlist(const QString &name)
     : m_name(name) {}
 
 QString Playlist::name() const { return m_name; }
 void Playlist::setName(const QString &name) { m_name = name; }
+
+bool Playlist::isFavorites() const { return m_isFavorites; }
+void Playlist::setFavorites(bool favorites) { m_isFavorites = favorites; }
 
 void Playlist::addTrack(Track *track) {
     if (!track || m_tracks.contains(track)) {
@@ -32,7 +33,8 @@ QVector<Track *> Playlist::search(const QString &query) const {
     QVector<Track *> result;
     for (Track *track : m_tracks) {
         if (track->title().toLower().contains(needle)
-            || track->artist().toLower().contains(needle)) {
+            || track->artist().toLower().contains(needle)
+            || track->album().toLower().contains(needle)) {
             result.append(track);
         }
     }

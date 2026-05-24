@@ -13,6 +13,9 @@ public:
     QString name() const;
     void setName(const QString &name);
 
+    bool isFavorites() const;
+    void setFavorites(bool favorites);
+
     void addTrack(Track *track);
     void removeTrack(Track *track);
     void clear();
@@ -22,6 +25,7 @@ public:
 
 private:
     QString m_name;
+    bool m_isFavorites = false;
     QVector<Track *> m_tracks;
 };
 

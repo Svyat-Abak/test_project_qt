@@ -1,5 +1,6 @@
 #include "CoverLabel.h"
 
+#include <QMouseEvent>
 #include <QPaintEvent>
 #include <QPainter>
 #include <QPainterPath>
@@ -42,6 +43,11 @@ void CoverLabel::clearCover() {
     update();
 }
 
+void CoverLabel::setFavoriteBadge(bool enabled) {
+    m_favoriteBadge = enabled;
+    update();
+}
+
 void CoverLabel::paintEvent(QPaintEvent *event) {
     Q_UNUSED(event)
 
@@ -75,6 +81,22 @@ void CoverLabel::paintEvent(QPaintEvent *event) {
     QPen glowOuter(QColor(255, 0, 204, 60), 4);
     painter.setPen(glowOuter);
     painter.drawRoundedRect(rect.adjusted(-2, -2, 2, 2), 20, 20);
+
+    if (m_favoriteBadge) {
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(255, 0, 102, 220));
+        painter.drawEllipse(rect.topRight() + QPoint(-28, 8), 12, 12);
+        painter.setPen(Qt::white);
+        QFont f = painter.font();
+        f.setPointSize(9);
+        painter.setFont(f);
+        painter.drawText(QRect(rect.right() - 34, rect.top() + 2, 24, 24), Qt::AlignCenter, QStringLiteral("♥"));
+    }
+}
+
+void CoverLabel::mousePressEvent(QMouseEvent *event) {
+    emit clicked();
+    QLabel::mousePressEvent(event);
 }
 
 void CoverLabel::resizeEvent(QResizeEvent *event) {

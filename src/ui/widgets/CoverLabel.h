@@ -5,6 +5,7 @@
 
 class CoverLabel : public QLabel {
     Q_OBJECT
+public:
 
 public:
     explicit CoverLabel(QWidget *parent = nullptr);
@@ -13,8 +14,13 @@ public:
     void loadCoverFromPath(const QString &path);
     void setPlaceholderText(const QString &text);
     void clearCover();
+    void setFavoriteBadge(bool enabled);
+
+signals:
+    void clicked();
 
 protected:
+    void mousePressEvent(QMouseEvent *event) override;
     void paintEvent(QPaintEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
 
@@ -23,6 +29,7 @@ private:
 
     QPixmap m_sourcePixmap;
     QString m_placeholder;
+    bool m_favoriteBadge = false;
 };
 
 #endif // COVERLABEL_H

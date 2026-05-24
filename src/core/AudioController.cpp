@@ -28,19 +28,23 @@ void AudioController::loadTrack(Track *track) {
         return;
     }
     m_currentTrack = track;
-    m_player->setSource(QUrl::fromLocalFile(track->filePath()));
+    const QString absPath = QFileInfo(track->filePath()).absoluteFilePath();
+    m_player->setSource(QUrl::fromLocalFile(absPath));
     emit trackChanged(track);
 }
 
 void AudioController::play() {
-    m_player->play();
+    m_pendingPlay = true;
+    tryStartPlayback();
 }
 
 void AudioController::pause() {
+    m_pendingPlay = false;
     m_player->pause();
 }
 
 void AudioController::stop() {
+    m_pendingPlay = false;
     m_player->stop();
 }
 
@@ -99,8 +103,23 @@ void AudioController::onMetaDataChanged() {
 }
 
 void AudioController::onMediaStatusChanged(QMediaPlayer::MediaStatus status) {
+    if (status == QMediaPlayer::LoadedMedia || status == QMediaPlayer::BufferedMedia) {
+        tryStartPlayback();
+    }
     if (status == QMediaPlayer::EndOfMedia) {
         emit finished();
+    }
+}
+
+void AudioController::tryStartPlayback() {
+    if (!m_pendingPlay) {
+        return;
+    }
+    const auto status = m_player->mediaStatus();
+    if (status == QMediaPlayer::LoadedMedia || status == QMediaPlayer::BufferedMedia
+        || status == QMediaPlayer::BufferingMedia) {
+        m_player->play();
+        m_pendingPlay = false;
     }
 }
 
@@ -128,6 +147,19 @@ void AudioController::applyMetadataToTrack() {
 
     if (m_player->duration() > 0) {
         m_currentTrack->setDuration(m_player->duration());
+    }
+
+    const auto album = m_player->metaData().value(QMediaMetaData::AlbumTitle).toString();
+    const auto genre = m_player->metaData().value(QMediaMetaData::Genre).toString();
+    const auto date = m_player->metaData().value(QMediaMetaData::Date).toString();
+    if (!album.isEmpty()) {
+        m_currentTrack->setAlbum(album);
+    }
+    if (!genre.isEmpty()) {
+        m_currentTrack->setGenre(genre);
+    }
+    if (!date.isEmpty()) {
+        m_currentTrack->setYear(date.left(4).toInt());
     }
 
     emit trackMetadataUpdated(m_currentTrack);

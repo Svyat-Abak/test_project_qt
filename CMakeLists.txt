@@ -18,15 +18,20 @@ find_package(Qt6 REQUIRED COMPONENTS
 set(PROJECT_SOURCES
     src/main.cpp
     src/core/Track.cpp
-    src/core/TrackStore.cpp
     src/core/Playlist.cpp
     src/core/PlaylistManager.cpp
     src/core/PlaybackQueue.cpp
     src/core/AudioController.cpp
+    src/core/LibraryStore.cpp
+    src/core/ListeningStats.cpp
     src/ui/MainWindow.cpp
     src/ui/widgets/CoverLabel.cpp
     src/ui/widgets/SpectrumVisualizer.cpp
     src/ui/widgets/NeonButton.cpp
+    src/ui/widgets/ParticleBackground.cpp
+    src/ui/widgets/NowPlayingPanel.cpp
+    src/ui/dialogs/TrackMetadataDialog.cpp
+    src/ui/dialogs/ProfileDialog.cpp
     resources/resources.qrc
 )
 
